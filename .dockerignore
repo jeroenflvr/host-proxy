@@ -1,0 +1,29 @@
+# Build artifacts
+target/
+*.rs.bk
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment
+.env
+.env.*
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker build context exclusions
+.git/
+.gitignore
+README.md
+LICENSE
+docs/
+tests/

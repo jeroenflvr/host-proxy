@@ -1,0 +1,32 @@
+services:
+  host-proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: host-proxy:latest
+    container_name: host-proxy
+    restart: unless-stopped
+    ports:
+      - "1984:1984"
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+    environment:
+      - CONFIG_PATH=/app/config.yaml
+      - LOG_LEVEL=info
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "1984"]
+      interval: 30s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+        reservations:
+          memory: 64M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
