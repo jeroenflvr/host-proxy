@@ -1,0 +1,70 @@
+# Host Proxy Configuration
+# This file can be hot-reloaded - changes take effect without restart
+
+server:
+  # Address and port to listen on
+  listen: "0.0.0.0:1984"
+  
+  # Number of worker threads (0 = number of CPU cores)
+  workers: 0
+  
+  # Connection timeouts in seconds
+  connect_timeout: 10
+  read_timeout: 30
+  write_timeout: 30
+
+ssl:
+  # Accept invalid/self-signed certificates when connecting upstream
+  accept_invalid_certs: false
+  
+  # Accept invalid hostnames in certificates
+  accept_invalid_hostnames: false
+
+logging:
+  # Log level: trace, debug, info, warn, error
+  level: "info"
+  
+  # Output destination: stdout, stderr, or file path
+  output: "stdout"
+  
+  # Log format: pretty, compact, json
+  format: "pretty"
+  
+  # Include timestamps in logs
+  timestamps: true
+  
+  # Include target (module path) in logs
+  include_target: true
+
+# Host to IP mappings for DNS bypass
+# The proxy will resolve these hostnames to the specified IP addresses
+host_mappings:
+  # Example: Route api.example.com to a specific IP
+  # - hostname: "api.example.com"
+  #   ip: "192.168.1.100"
+  #   port: 8080  # Optional, defaults to original request port
+  
+  # Example: Route internal service
+  # - hostname: "internal.service.local"
+  #   ip: "10.0.0.50"
+
+# Upstream proxy configuration
+# Used when a hostname is not in host_mappings and you have a corporate proxy.
+# 
+# IMPORTANT: This proxy does NOT read HTTP_PROXY/HTTPS_PROXY environment variables
+# because you'll typically set those to point to THIS proxy (http://localhost:1984).
+# Reading them would cause an infinite loop. Configure upstream proxy here only.
+upstream_proxy:
+  # HTTP proxy URL (e.g., "http://corporate-proxy.example.com:8080")
+  http: null
+  
+  # HTTPS proxy URL (e.g., "http://corporate-proxy.example.com:8080")
+  https: null
+  
+  # Hosts to bypass the upstream proxy
+  # Supports exact matches and suffix matches starting with .
+  no_proxy:
+    - "localhost"
+    - "127.0.0.1"
+    - "::1"
+    - ".local"

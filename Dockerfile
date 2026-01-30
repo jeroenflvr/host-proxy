@@ -31,10 +31,11 @@ RUN strip target/release/host-proxy
 # Runtime stage - minimal image
 FROM debian:bookworm-slim AS runtime
 
-# Install only runtime dependencies
+# Install only runtime dependencies (tini for proper signal handling)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     libssl3 \
+    tini \
     && rm -rf /var/lib/apt/lists/* \
     && useradd -r -s /bin/false hostproxy
 
@@ -45,6 +46,7 @@ COPY --from=builder /app/target/release/host-proxy /app/host-proxy
 
 # Create config directory for mount point
 RUN mkdir -p /app/config && chown -R hostproxy:hostproxy /app
+COPY ./config-example.yaml /app/config.yaml
 
 # Run as non-root user
 USER hostproxy
@@ -60,5 +62,6 @@ EXPOSE 1984
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
     CMD nc -z localhost 1984 || exit 1
 
-# Run the proxy
-ENTRYPOINT ["/app/host-proxy"]
+# Run the proxy with tini for proper signal handling (Ctrl-C)
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["/app/host-proxy"]
