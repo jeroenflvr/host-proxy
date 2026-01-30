@@ -1,6 +1,6 @@
 # Host Proxy
 
-A high-performance DNS bypass HTTP/HTTPS proxy server with configurable host-to-IP mappings, built with [hyper](https://hyper.rs/).
+A high-performance DNS bypass HTTP/HTTPS proxy server with configurable host-to-IP (and port!) mappings, built with [hyper](https://hyper.rs/).
 
 ## Features
 
@@ -34,7 +34,7 @@ docker build -t host-proxy .
 
 # Run with your config file mounted
 docker run -d \
-  --name host-proxy \
+  --name jeroenflvr/host-proxy \
   -p 1984:1984 \
   -v $(pwd)/config.yaml:/app/config.yaml:ro \
   host-proxy
