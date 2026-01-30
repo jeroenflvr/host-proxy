@@ -43,11 +43,8 @@ WORKDIR /app
 # Copy the binary from builder
 COPY --from=builder /app/target/release/host-proxy /app/host-proxy
 
-# Copy default config (can be overridden with volume mount)
-COPY config.yaml /app/config.yaml
-
-# Set ownership
-RUN chown -R hostproxy:hostproxy /app
+# Create config directory for mount point
+RUN mkdir -p /app/config && chown -R hostproxy:hostproxy /app
 
 # Run as non-root user
 USER hostproxy
