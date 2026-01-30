@@ -1,0 +1,14 @@
+/target
+.env
+config.y*ml
+.DS_Store
+.idea/
+.vscode/
+*.log
+node_modules/
+dist/
+*.tmp
+*.bak
+*.swp
+*.class
+*.jar
