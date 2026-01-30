@@ -361,17 +361,31 @@ mod resolver_tests {
 
     #[test]
     fn test_dns_resolution() {
+        use host_proxy::resolver::ResolveResult;
+        
         let config = AppConfig::default();
         let resolver = create_resolver_with_config(config);
 
-        // Test with a host that should resolve via DNS
-        // Using localhost which should always resolve
-        let resolved = resolver.dns_resolve("localhost", 80);
-        assert!(resolved.is_some(), "localhost should resolve");
+        // Test with a host that should resolve via DNS (no proxy configured)
+        // Using localhost which should fall through to DNS resolution
+        let result = resolver.resolve("localhost", 80, false);
+        match result {
+            ResolveResult::Dns { hostname, port } => {
+                assert_eq!(hostname, "localhost");
+                assert_eq!(port, 80);
+            }
+            _ => panic!("Expected Dns result for localhost with no proxy configured"),
+        }
 
-        // Test with invalid hostname
-        let resolved = resolver.dns_resolve("this.host.definitely.does.not.exist.invalid", 80);
-        assert!(resolved.is_none(), "invalid host should not resolve");
+        // Test with another hostname - should also fall through to DNS
+        let result = resolver.resolve("example.com", 443, true);
+        match result {
+            ResolveResult::Dns { hostname, port } => {
+                assert_eq!(hostname, "example.com");
+                assert_eq!(port, 443);
+            }
+            _ => panic!("Expected Dns result for example.com with no proxy configured"),
+        }
     }
 }
 

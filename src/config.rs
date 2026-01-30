@@ -362,15 +362,6 @@ impl AppConfig {
             .map(|m| (m.hostname.to_lowercase(), m.clone()))
             .collect()
     }
-
-    /// Looks up a hostname in the mappings.
-    #[allow(dead_code)]
-    pub fn lookup_host(&self, hostname: &str) -> Option<&HostMapping> {
-        let hostname_lower = hostname.to_lowercase();
-        self.host_mappings
-            .iter()
-            .find(|m| m.hostname.to_lowercase() == hostname_lower)
-    }
 }
 
 /// Thread-safe configuration holder with hot-reload support.
@@ -588,10 +579,10 @@ logging:
             ..Default::default()
         };
 
-        // Case-insensitive lookup
-        assert!(config.lookup_host("example.com").is_some());
-        assert!(config.lookup_host("EXAMPLE.COM").is_some());
-        assert!(config.lookup_host("notfound.com").is_none());
+        // Case-insensitive lookup via build_host_map
+        let host_map = config.build_host_map();
+        assert!(host_map.get("example.com").is_some());
+        assert!(host_map.get("notfound.com").is_none());
     }
 
     #[test]

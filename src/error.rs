@@ -7,7 +7,6 @@ use thiserror::Error;
 
 /// Main error type for the host-proxy application.
 #[derive(Error, Debug)]
-#[allow(dead_code)]
 pub enum ProxyError {
     /// Configuration file could not be found.
     #[error("Configuration file not found: {path}")]
@@ -21,32 +20,11 @@ pub enum ProxyError {
     #[error("Invalid configuration: {message}")]
     ConfigValidation { message: String },
 
-    /// Failed to set up file watcher for hot-reload.
-    #[error("Failed to set up config file watcher: {message}")]
-    WatcherSetup { message: String },
-
-    /// Network-related error.
-    #[error("Network error: {message}")]
-    Network { message: String },
-
-    /// Upstream proxy error.
-    #[error("Upstream proxy error: {message}")]
-    UpstreamProxy { message: String },
-
-    /// DNS resolution error.
-    #[error("DNS resolution failed for host: {host}")]
-    DnsResolution { host: String },
-
     /// I/O error wrapper.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
-
-    /// Generic error for unexpected conditions.
-    #[error("Internal error: {message}")]
-    Internal { message: String },
 }
 
-#[allow(dead_code)]
 impl ProxyError {
     /// Creates a new configuration parse error.
     pub fn config_parse(message: impl Into<String>) -> Self {
@@ -58,20 +36,6 @@ impl ProxyError {
     /// Creates a new configuration validation error.
     pub fn config_validation(message: impl Into<String>) -> Self {
         Self::ConfigValidation {
-            message: message.into(),
-        }
-    }
-
-    /// Creates a new network error.
-    pub fn network(message: impl Into<String>) -> Self {
-        Self::Network {
-            message: message.into(),
-        }
-    }
-
-    /// Creates a new internal error.
-    pub fn internal(message: impl Into<String>) -> Self {
-        Self::Internal {
             message: message.into(),
         }
     }

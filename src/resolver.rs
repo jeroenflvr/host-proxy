@@ -7,9 +7,9 @@
 
 use crate::config::{AppConfig, HostMapping};
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::net::IpAddr;
 use std::sync::{Arc, RwLock};
-use tracing::{debug, trace, warn};
+use tracing::{debug, trace};
 
 /// Result of host resolution.
 #[derive(Debug, Clone, PartialEq)]
@@ -149,31 +149,13 @@ impl HostResolver {
             port,
         }
     }
-
-    /// Performs DNS resolution for a hostname.
-    pub fn dns_resolve(&self, hostname: &str, port: u16) -> Option<SocketAddr> {
-        let addr_str = format!("{}:{}", hostname, port);
-
-        match addr_str.to_socket_addrs() {
-            Ok(mut addrs) => {
-                let resolved = addrs.next();
-                if let Some(addr) = resolved {
-                    debug!(hostname = %hostname, addr = %addr, "DNS resolved");
-                }
-                resolved
-            }
-            Err(e) => {
-                warn!(hostname = %hostname, error = %e, "DNS resolution failed");
-                None
-            }
-        }
-    }
 }
 
 
 
 /// Parses a host:port string, using default port if not specified.
-pub fn parse_host_port(host_header: &str, default_port: u16) -> (String, u16) {
+#[cfg(test)]
+fn parse_host_port(host_header: &str, default_port: u16) -> (String, u16) {
     if let Some(colon_pos) = host_header.rfind(':') {
         // Check if this is an IPv6 address
         if host_header.starts_with('[') {
@@ -200,21 +182,6 @@ pub fn parse_host_port(host_header: &str, default_port: u16) -> (String, u16) {
     } else {
         (host_header.to_string(), default_port)
     }
-}
-
-/// Extracts hostname from a URL string.
-#[allow(dead_code)]
-pub fn extract_hostname(url: &str) -> Option<String> {
-    // Simple extraction without full URL parsing
-    let without_scheme = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))
-        .unwrap_or(url);
-
-    let host_part = without_scheme.split('/').next()?;
-    let (hostname, _) = parse_host_port(host_part, 80);
-
-    Some(hostname)
 }
 
 #[cfg(test)]
@@ -344,22 +311,6 @@ mod tests {
             ("[::1]".to_string(), 8080)
         );
         assert_eq!(parse_host_port("[::1]", 80), ("[::1]".to_string(), 80));
-    }
-
-    #[test]
-    fn test_extract_hostname() {
-        assert_eq!(
-            extract_hostname("https://example.com/path"),
-            Some("example.com".to_string())
-        );
-        assert_eq!(
-            extract_hostname("http://example.com:8080/path"),
-            Some("example.com".to_string())
-        );
-        assert_eq!(
-            extract_hostname("example.com/path"),
-            Some("example.com".to_string())
-        );
     }
 
     #[test]

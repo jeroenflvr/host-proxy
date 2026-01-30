@@ -56,7 +56,7 @@ pub fn init_logging(
 
         // Set default level and reduce noise from dependencies
         EnvFilter::new(format!(
-            "{},hyper=warn,rustls=warn,pingora=info",
+            "{},hyper=warn,rustls=warn,h2=warn",
             level_filter
         ))
     });

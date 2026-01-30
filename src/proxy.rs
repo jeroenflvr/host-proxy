@@ -18,8 +18,10 @@ use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
 /// The proxy server state.
@@ -39,7 +41,7 @@ impl ProxyServer {
     /// Runs the proxy server.
     pub async fn run(&self) -> anyhow::Result<()> {
         let listen_addr = {
-            let cfg = self.config.read().unwrap();
+            let cfg = self.config.read().expect("config lock poisoned");
             cfg.server.listen.clone()
         };
 
@@ -121,10 +123,15 @@ async fn handle_request(
 async fn handle_connect(
     req: Request<Incoming>,
     client_addr: SocketAddr,
-    _config: Arc<RwLock<AppConfig>>,
+    config: Arc<RwLock<AppConfig>>,
     resolver: HostResolver,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
     let uri = req.uri().clone();
+    
+    let connect_timeout = {
+        let cfg = config.read().expect("config lock poisoned");
+        Duration::from_secs(cfg.server.connect_timeout)
+    };
     
     // Parse host:port from CONNECT request
     let (host, port) = match parse_connect_target(&uri) {
@@ -185,9 +192,9 @@ async fn handle_connect(
             Ok(upgraded) => {
                 let upgraded = TokioIo::new(upgraded);
                 
-                // Connect to target
-                match TcpStream::connect(&target_addr).await {
-                    Ok(target_stream) => {
+                // Connect to target with timeout
+                match timeout(connect_timeout, TcpStream::connect(&target_addr)).await {
+                    Ok(Ok(target_stream)) => {
                         if let Err(e) = tunnel(upgraded, target_stream).await {
                             debug!(
                                 client = %client_addr,
@@ -197,12 +204,19 @@ async fn handle_connect(
                             );
                         }
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         error!(
                             client = %client_addr,
                             target = %target_addr,
                             error = %e,
                             "Failed to connect to target"
+                        );
+                    }
+                    Err(_) => {
+                        error!(
+                            client = %client_addr,
+                            target = %target_addr,
+                            "Connection timeout"
                         );
                     }
                 }
@@ -230,17 +244,13 @@ async fn handle_connect_via_proxy(
     target_port: u16,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
     // Parse proxy URL
-    let proxy_uri: Uri = match proxy_url.parse() {
-        Ok(u) => u,
-        Err(e) => {
-            error!(error = %e, "Invalid proxy URL");
+    let proxy_addr = match parse_proxy_addr(&proxy_url) {
+        Some(addr) => addr,
+        None => {
+            error!(proxy = %proxy_url, "Invalid proxy URL");
             return Ok(error_response(StatusCode::BAD_GATEWAY, "Invalid proxy configuration"));
         }
     };
-
-    let proxy_host = proxy_uri.host().unwrap_or("localhost");
-    let proxy_port = proxy_uri.port_u16().unwrap_or(3128);
-    let proxy_addr = format!("{}:{}", proxy_host, proxy_port);
 
     tokio::task::spawn(async move {
         match hyper::upgrade::on(req).await {
@@ -315,6 +325,11 @@ async fn handle_http(
     config: Arc<RwLock<AppConfig>>,
     resolver: HostResolver,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
+    let connect_timeout = {
+        let cfg = config.read().expect("config lock poisoned");
+        Duration::from_secs(cfg.server.connect_timeout)
+    };
+    
     // Extract host from request
     let host = req.uri().host()
         .or_else(|| req.headers().get("host").and_then(|h| h.to_str().ok()).map(|h| {
@@ -325,7 +340,6 @@ async fn handle_http(
         .to_string();
 
     let port = req.uri().port_u16().unwrap_or(80);
-    let is_https = req.uri().scheme_str() == Some("https");
 
     if host.is_empty() {
         return Ok(error_response(StatusCode::BAD_REQUEST, "Missing host"));
@@ -343,7 +357,7 @@ async fn handle_http(
                 port = port,
                 "HTTP request to mapped IP"
             );
-            forward_http_request(req, format!("{}:{}", ip, port), is_https, &config).await
+            forward_http_request(req, format!("{}:{}", ip, port), connect_timeout).await
         }
         ResolveResult::Dns { hostname, port } => {
             debug!(
@@ -352,7 +366,7 @@ async fn handle_http(
                 port = port,
                 "HTTP request via DNS"
             );
-            forward_http_request(req, format!("{}:{}", hostname, port), is_https, &config).await
+            forward_http_request(req, format!("{}:{}", hostname, port), connect_timeout).await
         }
         ResolveResult::Proxy { proxy_url, original_host, original_port, .. } => {
             debug!(
@@ -362,7 +376,7 @@ async fn handle_http(
                 proxy = %proxy_url,
                 "HTTP request via upstream proxy"
             );
-            forward_http_via_proxy(req, proxy_url).await
+            forward_http_via_proxy(req, proxy_url, connect_timeout).await
         }
     }
 }
@@ -371,15 +385,18 @@ async fn handle_http(
 async fn forward_http_request(
     req: Request<Incoming>,
     target_addr: String,
-    _is_https: bool,
-    _config: &Arc<RwLock<AppConfig>>,
+    connect_timeout: Duration,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
-    // Connect to target
-    let stream = match TcpStream::connect(&target_addr).await {
-        Ok(s) => s,
-        Err(e) => {
+    // Connect to target with timeout
+    let stream = match timeout(connect_timeout, TcpStream::connect(&target_addr)).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
             error!(target = %target_addr, error = %e, "Failed to connect");
             return Ok(error_response(StatusCode::BAD_GATEWAY, "Failed to connect to target"));
+        }
+        Err(_) => {
+            error!(target = %target_addr, "Connection timeout");
+            return Ok(error_response(StatusCode::GATEWAY_TIMEOUT, "Connection timeout"));
         }
     };
 
@@ -440,25 +457,26 @@ async fn forward_http_request(
 async fn forward_http_via_proxy(
     req: Request<Incoming>,
     proxy_url: String,
+    connect_timeout: Duration,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
     // Parse proxy URL
-    let proxy_uri: Uri = match proxy_url.parse() {
-        Ok(u) => u,
-        Err(_) => {
+    let proxy_addr = match parse_proxy_addr(&proxy_url) {
+        Some(addr) => addr,
+        None => {
             return Ok(error_response(StatusCode::BAD_GATEWAY, "Invalid proxy URL"));
         }
     };
 
-    let proxy_host = proxy_uri.host().unwrap_or("localhost");
-    let proxy_port = proxy_uri.port_u16().unwrap_or(3128);
-    let proxy_addr = format!("{}:{}", proxy_host, proxy_port);
-
-    // Connect to proxy
-    let stream = match TcpStream::connect(&proxy_addr).await {
-        Ok(s) => s,
-        Err(e) => {
+    // Connect to proxy with timeout
+    let stream = match timeout(connect_timeout, TcpStream::connect(&proxy_addr)).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
             error!(proxy = %proxy_addr, error = %e, "Failed to connect to proxy");
             return Ok(error_response(StatusCode::BAD_GATEWAY, "Failed to connect to proxy"));
+        }
+        Err(_) => {
+            error!(proxy = %proxy_addr, "Proxy connection timeout");
+            return Ok(error_response(StatusCode::GATEWAY_TIMEOUT, "Proxy connection timeout"));
         }
     };
 
@@ -519,6 +537,14 @@ where
         "Tunnel closed"
     );
     Ok(())
+}
+
+/// Parse a proxy URL into host:port address.
+fn parse_proxy_addr(proxy_url: &str) -> Option<String> {
+    let uri: Uri = proxy_url.parse().ok()?;
+    let host = uri.host()?;
+    let port = uri.port_u16().unwrap_or(3128);
+    Some(format!("{}:{}", host, port))
 }
 
 /// Parse CONNECT target (host:port).
