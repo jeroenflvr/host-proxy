@@ -26,6 +26,33 @@ cargo build --release
 # Binary will be at target/release/host-proxy
 ```
 
+### Using Docker
+
+```bash
+# Build the image
+docker build -t host-proxy .
+
+# Run with your config file mounted
+docker run -d \
+  --name host-proxy \
+  -p 1984:1984 \
+  -v $(pwd)/config.yaml:/app/config.yaml:ro \
+  host-proxy
+```
+
+### Using Docker Compose
+
+```bash
+# Start the proxy
+docker compose up -d
+
+# View logs
+docker compose logs -f
+
+# Stop
+docker compose down
+```
+
 ## Quick Start
 
 1. **Create configuration file** (`config.yaml`):
