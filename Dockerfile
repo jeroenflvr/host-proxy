@@ -1,5 +1,5 @@
 # Build stage - compile the Rust binary with optimizations
-FROM --platform=amd64 rust:1.93-slim-bookworm AS builder
+FROM rust:1.93-slim-bookworm AS builder
 
 WORKDIR /app
 
@@ -29,7 +29,7 @@ RUN cargo build --release --locked
 RUN strip target/release/host-proxy
 
 # Runtime stage - minimal image
-FROM --platform=amd64 debian:bookworm-slim AS runtime
+FROM debian:bookworm-slim AS runtime
 
 # Install only runtime dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
