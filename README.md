@@ -1,15 +1,15 @@
 # Host Proxy
 
-A high-performance DNS bypass HTTP/HTTPS proxy server with configurable host-to-IP mappings, built on [Pingora](https://github.com/cloudflare/pingora).
+A high-performance DNS bypass HTTP/HTTPS proxy server with configurable host-to-IP mappings, built with [hyper](https://hyper.rs/).
 
 ## Features
 
 - 🔀 **DNS Bypass**: Route specific hostnames to configured IP addresses
-- 🔒 **HTTPS Support**: Full CONNECT tunneling with optional SSL error bypass
+- 🔒 **HTTPS Support**: Full CONNECT tunneling for secure connections
 - 🔗 **Upstream Proxy**: Forward to upstream HTTP/HTTPS proxies
 - 🔄 **Hot Reload**: Configuration changes take effect without restart
 - 📝 **Flexible Logging**: Configurable levels, formats, and output destinations
-- ⚡ **High Performance**: Built on Cloudflare's Pingora framework
+- ⚡ **High Performance**: Built on the hyper HTTP library
 
 ## Installation
 
