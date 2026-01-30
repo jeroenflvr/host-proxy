@@ -4,12 +4,12 @@ A high-performance DNS bypass HTTP/HTTPS proxy server with configurable host-to-
 
 ## Features
 
-- 🔀 **DNS Bypass**: Route specific hostnames to configured IP addresses
-- 🔒 **HTTPS Support**: Full CONNECT tunneling for secure connections
-- 🔗 **Upstream Proxy**: Forward to upstream HTTP/HTTPS proxies
-- 🔄 **Hot Reload**: Configuration changes take effect without restart
-- 📝 **Flexible Logging**: Configurable levels, formats, and output destinations
-- ⚡ **High Performance**: Built on the hyper HTTP library
+- **DNS Bypass**: Route specific hostnames to configured IP addresses
+- **HTTPS Support**: Full CONNECT tunneling for secure connections
+- **Upstream Proxy**: Forward to upstream HTTP/HTTPS proxies
+- **Hot Reload**: Configuration changes take effect without restart
+- **Flexible Logging**: Configurable levels, formats, and output destinations
+- **High Performance**: Built on the hyper HTTP library
 
 ## Installation
 
