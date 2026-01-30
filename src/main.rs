@@ -5,7 +5,7 @@
 //! ## Features
 //!
 //! - **DNS Bypass**: Route specific hostnames to configured IP addresses
-//! - **HTTPS Support**: Full CONNECT tunneling with optional SSL error bypass
+//! - **HTTPS Support**: Full CONNECT tunneling for direct connections
 //! - **Upstream Proxy**: Forward to upstream proxies when configured
 //! - **Hot Reload**: Configuration changes take effect without restart
 //! - **Flexible Logging**: Configurable log levels and output destinations
@@ -37,21 +37,12 @@ mod proxy;
 mod resolver;
 
 use crate::config::{get_config_path, get_log_level_override, ConfigManager};
-use crate::proxy::HostProxyService;
-use pingora_core::prelude::*;
-use pingora_proxy::http_proxy_service;
+use crate::proxy::ProxyServer;
 use tracing::{error, info};
 
 /// Application entry point.
-fn main() {
-    // Load environment variables from .env file
-    if let Err(e) = dotenvy::dotenv() {
-        // Not an error if .env doesn't exist
-        if !matches!(e, dotenvy::Error::Io(_)) {
-            eprintln!("Warning: Failed to load .env file: {}", e);
-        }
-    }
-
+#[tokio::main]
+async fn main() {
     // Load configuration
     let config_path = get_config_path();
     let config_manager = match ConfigManager::new(&config_path) {
@@ -80,23 +71,18 @@ fn main() {
         "Starting host-proxy"
     );
 
-    // Create Pingora server
-    let mut server = Server::new(None).expect("Failed to create server");
-    server.bootstrap();
-
-    // Create the proxy service
+    // Create the proxy server
     let config_arc = config_manager.get_arc();
-    let proxy_service = HostProxyService::new(config_arc.clone());
+    let proxy_server = ProxyServer::new(config_arc.clone());
 
     // Start config file watcher for hot reload
-    // The proxy service shares the config Arc, so reloading the ConfigManager
-    // will automatically update the config the proxy sees
     match config_manager.start_watcher() {
         Ok(mut rx) => {
-            // Spawn a task to handle config reloads
-            std::thread::spawn(move || {
-                while rx.blocking_recv().is_some() {
+            let proxy_refresh = proxy_server.clone();
+            tokio::spawn(async move {
+                while rx.recv().await.is_some() {
                     info!("Configuration reloaded successfully");
+                    proxy_refresh.refresh();
                 }
             });
         }
@@ -106,15 +92,9 @@ fn main() {
         }
     }
 
-    // Create HTTP proxy service
-    let listen_addr = config.server.listen.clone();
-    let mut http_proxy = http_proxy_service(&server.configuration, proxy_service);
-    
-    http_proxy.add_tcp(&listen_addr);
-
-    info!(listen = %listen_addr, "Proxy server listening");
-
-    // Register and run
-    server.add_service(http_proxy);
-    server.run_forever();
+    // Run the proxy server
+    if let Err(e) = proxy_server.run().await {
+        error!(error = %e, "Proxy server error");
+        std::process::exit(1);
+    }
 }

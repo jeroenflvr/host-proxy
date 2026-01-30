@@ -46,6 +46,7 @@ pub enum ResolveResult {
 }
 
 /// Host resolver with cached config lookups.
+#[derive(Clone)]
 pub struct HostResolver {
     /// Thread-safe reference to the configuration.
     config: Arc<RwLock<AppConfig>>,
@@ -169,14 +170,7 @@ impl HostResolver {
     }
 }
 
-impl Clone for HostResolver {
-    fn clone(&self) -> Self {
-        Self {
-            config: self.config.clone(),
-            host_map: self.host_map.clone(),
-        }
-    }
-}
+
 
 /// Parses a host:port string, using default port if not specified.
 pub fn parse_host_port(host_header: &str, default_port: u16) -> (String, u16) {

@@ -1,706 +1,593 @@
-//! Pingora-based proxy implementation.
+//! Hyper-based forward proxy implementation.
 //!
-//! This module implements the HTTP/HTTPS proxy server using the Pingora
-//! framework. It handles:
-//! - HTTP CONNECT tunneling for HTTPS
-//! - Host header manipulation for mapped hosts
-//! - Upstream proxy forwarding
-//! - Direct connections with DNS resolution
+//! This module implements the HTTP/HTTPS forward proxy server using hyper.
+//! It handles:
+//! - HTTP CONNECT tunneling for HTTPS (bidirectional TCP tunnel)
+//! - Regular HTTP request forwarding
+//! - Host-to-IP mappings for DNS bypass
+//! - Optional upstream proxy forwarding
 
 use crate::config::AppConfig;
-use crate::resolver::{parse_host_port, HostResolver, ResolveResult};
-use async_trait::async_trait;
+use crate::resolver::{HostResolver, ResolveResult};
 use bytes::Bytes;
-use http::{header, Method, Uri};
-use pingora_core::prelude::*;
-use pingora_core::upstreams::peer::HttpPeer;
-use pingora_http::{RequestHeader, ResponseHeader};
-use pingora_proxy::{FailToProxy, ProxyHttp, Session};
+use http::{Method, Request, Response, StatusCode, Uri};
+use http_body_util::{combinators::BoxBody, BodyExt, Empty, Full};
+use hyper::body::Incoming;
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper_util::rt::TokioIo;
+use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
-use tracing::{debug, error, info, trace, warn};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tracing::{debug, error, info, warn};
 
-/// Context maintained across the request lifecycle.
-pub struct ProxyContext {
-    /// The resolved destination for this request.
-    pub resolve_result: Option<ResolveResult>,
-
-    /// Whether this is a CONNECT request (HTTPS tunnel).
-    pub is_connect: bool,
-
-    /// The original host from the request.
-    pub original_host: String,
-
-    /// The target port.
-    pub target_port: u16,
-
-    /// Whether to use TLS for upstream.
-    pub use_tls: bool,
-}
-
-impl Default for ProxyContext {
-    fn default() -> Self {
-        Self {
-            resolve_result: None,
-            is_connect: false,
-            original_host: String::new(),
-            target_port: 80,
-            use_tls: false,
-        }
-    }
-}
-
-/// The main proxy service.
-pub struct HostProxyService {
-    /// Host resolver with config access.
-    resolver: HostResolver,
-
-    /// Direct config access for SSL settings.
+/// The proxy server state.
+#[derive(Clone)]
+pub struct ProxyServer {
     config: Arc<RwLock<AppConfig>>,
+    resolver: HostResolver,
 }
 
-impl HostProxyService {
-    /// Creates a new proxy service.
+impl ProxyServer {
+    /// Creates a new proxy server.
     pub fn new(config: Arc<RwLock<AppConfig>>) -> Self {
         let resolver = HostResolver::new(config.clone());
-        Self { resolver, config }
+        Self { config, resolver }
+    }
+
+    /// Runs the proxy server.
+    pub async fn run(&self) -> anyhow::Result<()> {
+        let listen_addr = {
+            let cfg = self.config.read().unwrap();
+            cfg.server.listen.clone()
+        };
+
+        let addr: SocketAddr = listen_addr.parse()?;
+        let listener = TcpListener::bind(addr).await?;
+
+        info!(address = %addr, "Proxy server listening");
+
+        loop {
+            let (stream, client_addr) = listener.accept().await?;
+            
+            let config = self.config.clone();
+            let resolver = self.resolver.clone();
+
+            tokio::spawn(async move {
+                let io = TokioIo::new(stream);
+                
+                let service = service_fn(move |req| {
+                    let config = config.clone();
+                    let resolver = resolver.clone();
+                    async move {
+                        handle_request(req, client_addr, config, resolver).await
+                    }
+                });
+
+                if let Err(e) = http1::Builder::new()
+                    .preserve_header_case(true)
+                    .title_case_headers(true)
+                    .serve_connection(io, service)
+                    .with_upgrades()
+                    .await
+                {
+                    // Filter out common benign errors
+                    let err_str = e.to_string();
+                    if !err_str.contains("connection closed") 
+                        && !err_str.contains("broken pipe")
+                        && !err_str.contains("reset by peer") 
+                    {
+                        debug!(client = %client_addr, error = %e, "Connection error");
+                    }
+                }
+            });
+        }
     }
 
     /// Refreshes the resolver cache (called on config reload).
-    #[allow(dead_code)]
     pub fn refresh(&self) {
         self.resolver.refresh_cache();
     }
+}
 
-    /// Gets the current SSL configuration.
-    fn get_ssl_config(&self) -> (bool, bool) {
-        let cfg = self.config.read().unwrap();
-        (
-            cfg.ssl.accept_invalid_certs,
-            cfg.ssl.accept_invalid_hostnames,
-        )
-    }
+/// Handle an incoming HTTP request.
+async fn handle_request(
+    req: Request<Incoming>,
+    client_addr: SocketAddr,
+    config: Arc<RwLock<AppConfig>>,
+    resolver: HostResolver,
+) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
+    let method = req.method().clone();
+    let uri = req.uri().clone();
 
-    /// Gets timeout configuration.
-    fn get_timeouts(&self) -> (Duration, Duration, Duration) {
-        let cfg = self.config.read().unwrap();
-        (
-            Duration::from_secs(cfg.server.connect_timeout),
-            Duration::from_secs(cfg.server.read_timeout),
-            Duration::from_secs(cfg.server.write_timeout),
-        )
-    }
+    debug!(
+        client = %client_addr,
+        method = %method,
+        uri = %uri,
+        "Request received"
+    );
 
-    /// Parses the target from a CONNECT request.
-    fn parse_connect_target(uri: &Uri) -> Option<(String, u16)> {
-        // CONNECT requests have authority in the URI path
-        let authority = uri.authority().map(|a| a.as_str()).or_else(|| {
-            // Some clients put it in the path
-            let path = uri.path();
-            if !path.is_empty() && path != "/" {
-                Some(path)
-            } else {
-                None
-            }
-        })?;
-
-        Some(parse_host_port(authority, 443))
-    }
-
-    /// Creates an HttpPeer for upstream proxy connection.
-    #[allow(dead_code)]
-    fn create_proxy_peer(
-        &self,
-        proxy_url: &str,
-        target_host: &str,
-        _target_port: u16,
-        _is_https: bool,
-    ) -> Result<HttpPeer> {
-        // Parse proxy URL
-        let proxy_uri: Uri = proxy_url
-            .parse()
-            .map_err(|e| Error::new(ErrorType::Custom("Invalid proxy URL")).more_context(format!("{}", e)))?;
-
-        let proxy_host = proxy_uri.host().ok_or_else(|| {
-            Error::new(ErrorType::Custom("Proxy URL missing host"))
-        })?;
-
-        let proxy_port = proxy_uri.port_u16().unwrap_or(3128);
-
-        debug!(
-            proxy_host = %proxy_host,
-            proxy_port = proxy_port,
-            target = %target_host,
-            "Creating upstream proxy peer"
-        );
-
-        let (_accept_invalid_certs, _accept_invalid_hostnames) = self.get_ssl_config();
-
-        // Create peer to the proxy server
-        let mut peer = HttpPeer::new(
-            (proxy_host.to_string(), proxy_port),
-            false, // Proxy connection itself is usually HTTP
-            target_host.to_string(),
-        );
-
-        // Set SNI for TLS if proxy connection uses TLS
-        if proxy_uri.scheme_str() == Some("https") {
-            peer.sni = proxy_host.to_string();
-        }
-
-        Ok(peer)
+    if method == Method::CONNECT {
+        // HTTPS CONNECT tunnel
+        handle_connect(req, client_addr, config, resolver).await
+    } else {
+        // Regular HTTP proxy
+        handle_http(req, client_addr, config, resolver).await
     }
 }
 
-#[async_trait]
-impl ProxyHttp for HostProxyService {
-    type CTX = ProxyContext;
-
-    fn new_ctx(&self) -> Self::CTX {
-        ProxyContext::default()
-    }
-
-    /// Called early in request processing to determine routing.
-    async fn early_request_filter(
-        &self,
-        session: &mut Session,
-        ctx: &mut Self::CTX,
-    ) -> Result<()> {
-        let req = session.req_header();
-        let method = req.method.clone();
-        let uri = req.uri.clone();
-
-        ctx.is_connect = method == Method::CONNECT;
-
-        // Extract target host and port
-        let (host, port) = if ctx.is_connect {
-            Self::parse_connect_target(&uri).ok_or_else(|| {
-                Error::new(ErrorType::Custom("Invalid CONNECT target"))
-            })?
-        } else {
-            // For regular HTTP, get from Host header
-            let host_header = req
-                .headers
-                .get(header::HOST)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("");
-
-            if host_header.is_empty() {
-                // Try from URI
-                if let Some(authority) = uri.authority() {
-                    parse_host_port(authority.as_str(), 80)
-                } else {
-                    return Err(Error::new(ErrorType::Custom("No host specified")));
-                }
-            } else {
-                parse_host_port(host_header, 80)
-            }
-        };
-
-        ctx.original_host = host.clone();
-        ctx.target_port = port;
-        
-        // For CONNECT requests, the proxy acts as a TCP tunnel.
-        // The CLIENT will do the TLS handshake with the upstream server,
-        // so we should NOT use TLS on our upstream connection.
-        // Only use TLS for regular HTTPS requests (not CONNECT).
-        ctx.use_tls = !ctx.is_connect && uri.scheme_str() == Some("https");
-
-        // Resolve the destination
-        let resolve_result = self.resolver.resolve(&host, port, ctx.is_connect);
-        ctx.resolve_result = Some(resolve_result);
-
-        trace!(
-            method = %method,
-            host = %host,
-            port = port,
-            is_connect = ctx.is_connect,
-            "Request received"
-        );
-
-        Ok(())
-    }
-
-    /// Filter that handles CONNECT requests for direct connections.
-    /// 
-    /// For CONNECT requests going through an upstream proxy, Pingora's normal
-    /// flow works fine. But for direct CONNECT (to IP-mapped hosts or DNS),
-    /// we need to handle the tunneling ourselves because Pingora's ProxyHttp
-    /// is designed for HTTP reverse proxying, not TCP tunneling.
-    async fn request_filter(
-        &self,
-        session: &mut Session,
-        ctx: &mut Self::CTX,
-    ) -> Result<bool>
-    where
-        Self::CTX: Send + Sync,
-    {
-        // Only intercept CONNECT requests for direct connections
-        if !ctx.is_connect {
-            return Ok(false); // Let Pingora handle normal HTTP
+/// Handle CONNECT requests (HTTPS tunneling).
+async fn handle_connect(
+    req: Request<Incoming>,
+    client_addr: SocketAddr,
+    _config: Arc<RwLock<AppConfig>>,
+    resolver: HostResolver,
+) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
+    let uri = req.uri().clone();
+    
+    // Parse host:port from CONNECT request
+    let (host, port) = match parse_connect_target(&uri) {
+        Some((h, p)) => (h, p),
+        None => {
+            warn!(client = %client_addr, uri = %uri, "Invalid CONNECT target");
+            return Ok(error_response(StatusCode::BAD_REQUEST, "Invalid CONNECT target"));
         }
+    };
 
-        let resolve_result = ctx.resolve_result.as_ref().ok_or_else(|| {
-            Error::new(ErrorType::Custom("No resolve result"))
-        })?;
+    // Resolve the destination
+    let resolve_result = resolver.resolve(&host, port, true);
 
-        // For CONNECT through upstream proxy, let Pingora handle it normally
-        // For CONNECT requests, Pingora's ProxyHttp trait handles them correctly
-        // when routing through an upstream HTTP proxy (the proxy speaks HTTP CONNECT).
-        // 
-        // ARCHITECTURAL NOTE:
-        // Direct HTTPS CONNECT tunneling (connecting directly to the target) requires
-        // raw TCP socket access to bidirectionally copy bytes after the HTTP CONNECT
-        // handshake. Pingora's ProxyHttp trait is designed for HTTP request/response
-        // semantics and doesn't expose the raw socket needed for this.
-        //
-        // Therefore:
-        // - CONNECT through upstream proxy: Works perfectly (Pingora handles it)
-        // - Direct CONNECT to IP-mapped hosts: Routed through upstream proxy if configured
-        // - Direct CONNECT without upstream proxy: Not supported
-        
-        match resolve_result {
-            ResolveResult::Proxy { .. } => {
-                // Route through upstream proxy - Pingora handles this natively
-                debug!(
-                    host = %ctx.original_host,
-                    "CONNECT via upstream proxy - delegating to Pingora"
-                );
-                Ok(false)
-            }
-            ResolveResult::Direct { ip, port, original_host } => {
-                // For direct connections, we MUST use the upstream proxy for HTTPS CONNECT.
-                // Check if we have an upstream proxy configured.
-                let has_upstream_proxy = {
-                    let cfg = self.config.read().unwrap();
-                    cfg.upstream_proxy.https.as_ref().map(|s| !s.is_empty()).unwrap_or(false)
-                        || cfg.upstream_proxy.http.as_ref().map(|s| !s.is_empty()).unwrap_or(false)
-                };
-                
-                if has_upstream_proxy {
-                    // Re-route through the upstream proxy
-                    // Update the resolve result so upstream_peer uses the proxy
-                    warn!(
-                        host = %original_host,
-                        ip = %ip,
-                        port = port,
-                        "Direct HTTPS CONNECT not supported - routing through upstream proxy"
-                    );
-                    // We can't modify ctx here, so we'll handle this in upstream_peer
-                    // by checking for CONNECT + Direct and redirecting to proxy
-                    Ok(false)
-                } else {
-                    // No upstream proxy available - we can't handle direct CONNECT
-                    error!(
-                        host = %original_host,
-                        ip = %ip,
-                        port = port,
-                        "HTTPS CONNECT requires an upstream proxy. \
-                         Direct HTTPS tunneling is not supported by Pingora's ProxyHttp architecture. \
-                         Configure upstream_proxy in config.yaml to enable HTTPS CONNECT."
-                    );
-                    
-                    // Return a clear error to the client
-                    let mut resp = ResponseHeader::build(502, Some(2)).unwrap();
-                    resp.insert_header("Content-Type", "text/plain").ok();
-                    resp.insert_header("Proxy-Agent", "host-proxy").ok();
-                    
-                    if let Err(e) = session.write_response_header(Box::new(resp), false).await {
-                        error!(error = %e, "Failed to write error response header");
-                    } else {
-                        let msg = format!(
-                            "HTTPS CONNECT to {} requires an upstream proxy.\n\
-                             Configure upstream_proxy.url in config.yaml.",
-                            original_host
-                        );
-                        if let Err(e) = session.write_response_body(Some(Bytes::from(msg)), true).await {
-                            error!(error = %e, "Failed to write error response body");
-                        }
-                    }
-                    
-                    Ok(true) // We've handled the response
-                }
-            }
-            ResolveResult::Dns { hostname, port } => {
-                // Same logic for DNS-resolved hosts
-                let has_upstream_proxy = {
-                    let cfg = self.config.read().unwrap();
-                    cfg.upstream_proxy.https.as_ref().map(|s| !s.is_empty()).unwrap_or(false)
-                        || cfg.upstream_proxy.http.as_ref().map(|s| !s.is_empty()).unwrap_or(false)
-                };
-                
-                if has_upstream_proxy {
-                    warn!(
-                        host = %hostname,
-                        port = port,
-                        "Direct HTTPS CONNECT not supported - routing through upstream proxy"
-                    );
-                    Ok(false)
-                } else {
-                    error!(
-                        host = %hostname,
-                        port = port,
-                        "HTTPS CONNECT requires an upstream proxy. \
-                         Direct HTTPS tunneling is not supported. \
-                         Configure upstream_proxy in config.yaml."
-                    );
-                    
-                    let mut resp = ResponseHeader::build(502, Some(2)).unwrap();
-                    resp.insert_header("Content-Type", "text/plain").ok();
-                    resp.insert_header("Proxy-Agent", "host-proxy").ok();
-                    
-                    if let Err(e) = session.write_response_header(Box::new(resp), false).await {
-                        error!(error = %e, "Failed to write error response header");
-                    } else {
-                        let msg = format!(
-                            "HTTPS CONNECT to {} requires an upstream proxy.\n\
-                             Configure upstream_proxy.url in config.yaml.",
-                            hostname
-                        );
-                        if let Err(e) = session.write_response_body(Some(Bytes::from(msg)), true).await {
-                            error!(error = %e, "Failed to write error response body");
-                        }
-                    }
-                    
-                    Ok(true)
-                }
-            }
+    let target_addr = match &resolve_result {
+        ResolveResult::Direct { ip, port, original_host } => {
+            info!(
+                client = %client_addr,
+                host = %original_host,
+                ip = %ip,
+                port = port,
+                "CONNECT tunnel to mapped IP"
+            );
+            format!("{}:{}", ip, port)
         }
-    }
-
-    /// Determines the upstream peer to connect to.
-    async fn upstream_peer(
-        &self,
-        _session: &mut Session,
-        ctx: &mut Self::CTX,
-    ) -> Result<Box<HttpPeer>> {
-        let resolve_result = ctx.resolve_result.as_ref().ok_or_else(|| {
-            Error::new(ErrorType::Custom("No resolve result"))
-        })?;
-
-        let (accept_invalid_certs, accept_invalid_hostnames) = self.get_ssl_config();
-
-        // For CONNECT requests on Direct/Dns targets, we need to route through upstream proxy
-        // (if available). This is because Pingora's ProxyHttp can't do direct TCP tunneling.
-        if ctx.is_connect {
-            let proxy_info = {
-                let cfg = self.config.read().unwrap();
-                // For CONNECT, prefer HTTPS proxy, fall back to HTTP proxy
-                cfg.upstream_proxy.https.clone()
-                    .filter(|s| !s.is_empty())
-                    .or_else(|| cfg.upstream_proxy.http.clone().filter(|s| !s.is_empty()))
-            };
+        ResolveResult::Dns { hostname, port } => {
+            debug!(
+                client = %client_addr,
+                host = %hostname,
+                port = port,
+                "CONNECT tunnel via DNS"
+            );
+            format!("{}:{}", hostname, port)
+        }
+        ResolveResult::Proxy { proxy_url, original_host, original_port, .. } => {
+            // For upstream proxy, we connect to the proxy and send CONNECT
+            info!(
+                client = %client_addr,
+                host = %original_host,
+                port = original_port,
+                proxy = %proxy_url,
+                "CONNECT tunnel via upstream proxy"
+            );
             
-            if let Some(proxy_url) = proxy_info {
-                // For any CONNECT request, route through the upstream proxy
-                // This includes both Direct and Dns resolved hosts
-                match resolve_result {
-                    ResolveResult::Direct { original_host, port, .. } 
-                    | ResolveResult::Dns { hostname: original_host, port } => {
-                        info!(
-                            host = %original_host,
-                            port = port,
-                            proxy = %proxy_url,
-                            "Routing CONNECT through upstream proxy"
-                        );
-
-                        // Parse proxy URL
-                        let proxy_uri: Uri = proxy_url.parse().map_err(|_e| {
-                            Error::new(ErrorType::Custom("Invalid proxy URL"))
-                        })?;
-
-                        let proxy_host = proxy_uri.host().unwrap_or("localhost");
-                        let proxy_port = proxy_uri.port_u16().unwrap_or(3128);
-
-                        let mut peer = HttpPeer::new(
-                            (proxy_host.to_string(), proxy_port),
-                            false, // Connect to proxy over HTTP
-                            original_host.clone(),
-                        );
-
-                        // Ensure HTTP/1.1 for CONNECT
-                        peer.options.set_http_version(1, 1);
-                        
-                        // Store the target info in ctx for upstream_request_filter
-                        // We'll modify the context to indicate this is being rerouted
-                        ctx.resolve_result = Some(ResolveResult::Proxy {
-                            proxy_url: proxy_url,
-                            original_host: original_host.clone(),
-                            original_port: *port,
-                            is_https: true,
-                        });
-
-                        return Ok(Box::new(peer));
-                    }
-                    ResolveResult::Proxy { .. } => {
-                        // Already going through proxy, fall through
-                    }
-                }
-            }
+            return handle_connect_via_proxy(
+                req,
+                client_addr,
+                proxy_url.clone(),
+                original_host.clone(),
+                *original_port,
+            ).await;
         }
+    };
 
-        let peer = match resolve_result {
-            ResolveResult::Direct { ip, port, original_host } => {
-                info!(
-                    host = %original_host,
-                    ip = %ip,
-                    port = port,
-                    "Connecting directly (config mapping)"
-                );
-
-                let mut peer = HttpPeer::new(
-                    (*ip, *port),
-                    ctx.use_tls,
-                    original_host.clone(),
-                );
-
-                if ctx.use_tls {
-                    peer.sni = original_host.clone();
-                    peer.options.verify_cert = !accept_invalid_certs;
-                    peer.options.verify_hostname = !accept_invalid_hostnames;
-                }
-
-                peer
-            }
-
-            ResolveResult::Proxy {
-                proxy_url,
-                original_host,
-                original_port: _,
-                is_https: _,
-            } => {
-                info!(
-                    host = %original_host,
-                    proxy = %proxy_url,
-                    "Forwarding to upstream proxy"
-                );
-
-                // Parse proxy URL
-                let proxy_uri: Uri = proxy_url.parse().map_err(|_e| {
-                    Error::new(ErrorType::Custom("Invalid proxy URL"))
-                })?;
-
-                let proxy_host = proxy_uri.host().unwrap_or("localhost");
-                let proxy_port = proxy_uri.port_u16().unwrap_or(3128);
-
-                let mut peer = HttpPeer::new(
-                    (proxy_host.to_string(), proxy_port),
-                    false, // Connect to proxy over HTTP
-                    original_host.clone(),
-                );
-
-                // For CONNECT tunneling through proxy, we need to set up the tunnel
-                if ctx.is_connect {
-                    peer.options.set_http_version(1, 1);
-                }
-
-                peer
-            }
-
-            ResolveResult::Dns { hostname, port } => {
-                info!(
-                    host = %hostname,
-                    port = port,
-                    "Connecting via DNS resolution"
-                );
-
-                // Resolve via DNS
-                let resolved = self.resolver.dns_resolve(hostname, *port).ok_or_else(|| {
-                    warn!(hostname = %hostname, "DNS resolution failed");
-                    Error::new(ErrorType::Custom("DNS resolution failed"))
-                })?;
-
-                let mut peer = HttpPeer::new(
-                    resolved,
-                    ctx.use_tls,
-                    hostname.clone(),
-                );
-
-                if ctx.use_tls {
-                    peer.sni = hostname.clone();
-                    peer.options.verify_cert = !accept_invalid_certs;
-                    peer.options.verify_hostname = !accept_invalid_hostnames;
-                }
-
-                peer
-            }
-        };
-
-        // Apply timeouts
-        let (_connect_timeout, _read_timeout, _write_timeout) = self.get_timeouts();
-        // Note: Timeouts are typically set at the connection level in Pingora
-
-        Ok(Box::new(peer))
-    }
-
-    /// Modifies the request before sending upstream.
-    async fn upstream_request_filter(
-        &self,
-        _session: &mut Session,
-        upstream_request: &mut RequestHeader,
-        ctx: &mut Self::CTX,
-    ) -> Result<()> {
-        // For CONNECT through upstream proxy, we need special handling
-        if let Some(ResolveResult::Proxy { original_host, original_port, is_https: _, .. }) = &ctx.resolve_result {
-            if ctx.is_connect {
-                // Rewrite the request to be a CONNECT to the original target
-                upstream_request.set_method(Method::CONNECT);
+    // Spawn the tunnel task after returning 200 Connection Established
+    tokio::task::spawn(async move {
+        // This is handled by hyper's upgrade mechanism
+        match hyper::upgrade::on(req).await {
+            Ok(upgraded) => {
+                let upgraded = TokioIo::new(upgraded);
                 
-                // Set the authority to the original target
-                let authority = format!("{}:{}", original_host, original_port);
-                upstream_request.set_uri(
-                    Uri::builder()
-                        .authority(authority.as_str())
-                        .path_and_query("/")
-                        .build()
-                        .unwrap_or_else(|_| Uri::from_static("/"))
-                );
+                // Connect to target
+                match TcpStream::connect(&target_addr).await {
+                    Ok(target_stream) => {
+                        if let Err(e) = tunnel(upgraded, target_stream).await {
+                            debug!(
+                                client = %client_addr,
+                                target = %target_addr,
+                                error = %e,
+                                "Tunnel error"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        error!(
+                            client = %client_addr,
+                            target = %target_addr,
+                            error = %e,
+                            "Failed to connect to target"
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                error!(client = %client_addr, error = %e, "Upgrade failed");
             }
         }
+    });
 
-        // Ensure Host header is set correctly for mapped hosts
-        if let Some(ResolveResult::Direct { original_host, .. }) = &ctx.resolve_result {
-            // Update Host header to the original hostname
-            upstream_request.insert_header(
-                header::HOST,
-                original_host.as_str(),
-            )?;
+    // Return 200 Connection Established
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header("Proxy-Agent", "host-proxy")
+        .body(empty_body())
+        .unwrap())
+}
+
+/// Handle CONNECT via upstream proxy.
+async fn handle_connect_via_proxy(
+    req: Request<Incoming>,
+    client_addr: SocketAddr,
+    proxy_url: String,
+    target_host: String,
+    target_port: u16,
+) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
+    // Parse proxy URL
+    let proxy_uri: Uri = match proxy_url.parse() {
+        Ok(u) => u,
+        Err(e) => {
+            error!(error = %e, "Invalid proxy URL");
+            return Ok(error_response(StatusCode::BAD_GATEWAY, "Invalid proxy configuration"));
         }
+    };
 
-        // Add Via header
-        upstream_request.append_header("Via", "1.1 host-proxy")?;
+    let proxy_host = proxy_uri.host().unwrap_or("localhost");
+    let proxy_port = proxy_uri.port_u16().unwrap_or(3128);
+    let proxy_addr = format!("{}:{}", proxy_host, proxy_port);
 
-        trace!(
-            method = %upstream_request.method,
-            uri = %upstream_request.uri,
-            "Sending upstream request"
-        );
+    tokio::task::spawn(async move {
+        match hyper::upgrade::on(req).await {
+            Ok(upgraded) => {
+                let client_stream = TokioIo::new(upgraded);
+                
+                // Connect to proxy
+                match TcpStream::connect(&proxy_addr).await {
+                    Ok(mut proxy_stream) => {
+                        // Send CONNECT to upstream proxy
+                        let connect_req = format!(
+                            "CONNECT {}:{} HTTP/1.1\r\nHost: {}:{}\r\n\r\n",
+                            target_host, target_port, target_host, target_port
+                        );
+                        
+                        if let Err(e) = proxy_stream.write_all(connect_req.as_bytes()).await {
+                            error!(error = %e, "Failed to send CONNECT to upstream proxy");
+                            return;
+                        }
 
-        Ok(())
+                        // Read proxy response (we expect 200)
+                        let mut buf = [0u8; 1024];
+                        match tokio::io::AsyncReadExt::read(&mut proxy_stream, &mut buf).await {
+                            Ok(n) if n > 0 => {
+                                let response = String::from_utf8_lossy(&buf[..n]);
+                                if !response.contains("200") {
+                                    error!(response = %response, "Upstream proxy rejected CONNECT");
+                                    return;
+                                }
+                            }
+                            Ok(_) => {
+                                error!("Upstream proxy closed connection");
+                                return;
+                            }
+                            Err(e) => {
+                                error!(error = %e, "Failed to read from upstream proxy");
+                                return;
+                            }
+                        }
+
+                        // Now tunnel between client and proxy
+                        if let Err(e) = tunnel(client_stream, proxy_stream).await {
+                            debug!(error = %e, "Proxy tunnel error");
+                        }
+                    }
+                    Err(e) => {
+                        error!(
+                            proxy = %proxy_addr,
+                            error = %e,
+                            "Failed to connect to upstream proxy"
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                error!(client = %client_addr, error = %e, "Upgrade failed");
+            }
+        }
+    });
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header("Proxy-Agent", "host-proxy")
+        .body(empty_body())
+        .unwrap())
+}
+
+/// Handle regular HTTP requests.
+async fn handle_http(
+    req: Request<Incoming>,
+    client_addr: SocketAddr,
+    config: Arc<RwLock<AppConfig>>,
+    resolver: HostResolver,
+) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
+    // Extract host from request
+    let host = req.uri().host()
+        .or_else(|| req.headers().get("host").and_then(|h| h.to_str().ok()).map(|h| {
+            // Remove port from host header if present
+            h.split(':').next().unwrap_or(h)
+        }))
+        .unwrap_or("")
+        .to_string();
+
+    let port = req.uri().port_u16().unwrap_or(80);
+    let is_https = req.uri().scheme_str() == Some("https");
+
+    if host.is_empty() {
+        return Ok(error_response(StatusCode::BAD_REQUEST, "Missing host"));
     }
 
-    /// Modifies the response before sending to client.
-    async fn response_filter(
-        &self,
-        _session: &mut Session,
-        upstream_response: &mut ResponseHeader,
-        _ctx: &mut Self::CTX,
-    ) -> Result<()> {
-        // Add proxy identifier header
-        upstream_response.insert_header("X-Proxy", "host-proxy")?;
+    // Resolve the destination
+    let resolve_result = resolver.resolve(&host, port, false);
 
-        trace!(
-            status = %upstream_response.status,
-            "Received upstream response"
-        );
-
-        Ok(())
+    match resolve_result {
+        ResolveResult::Direct { ip, port, original_host } => {
+            debug!(
+                client = %client_addr,
+                host = %original_host,
+                ip = %ip,
+                port = port,
+                "HTTP request to mapped IP"
+            );
+            forward_http_request(req, format!("{}:{}", ip, port), is_https, &config).await
+        }
+        ResolveResult::Dns { hostname, port } => {
+            debug!(
+                client = %client_addr,
+                host = %hostname,
+                port = port,
+                "HTTP request via DNS"
+            );
+            forward_http_request(req, format!("{}:{}", hostname, port), is_https, &config).await
+        }
+        ResolveResult::Proxy { proxy_url, original_host, original_port, .. } => {
+            debug!(
+                client = %client_addr,
+                host = %original_host,
+                port = original_port,
+                proxy = %proxy_url,
+                "HTTP request via upstream proxy"
+            );
+            forward_http_via_proxy(req, proxy_url).await
+        }
     }
+}
 
-    /// Handles errors during proxying.
-    async fn fail_to_proxy(
-        &self,
-        _session: &mut Session,
-        e: &Error,
-        ctx: &mut Self::CTX,
-    ) -> FailToProxy
-    where
-        Self::CTX: Send + Sync,
-    {
-        error!(
-            error = %e,
-            host = %ctx.original_host,
-            "Proxy error"
-        );
+/// Forward an HTTP request directly to the target.
+async fn forward_http_request(
+    req: Request<Incoming>,
+    target_addr: String,
+    _is_https: bool,
+    _config: &Arc<RwLock<AppConfig>>,
+) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
+    // Connect to target
+    let stream = match TcpStream::connect(&target_addr).await {
+        Ok(s) => s,
+        Err(e) => {
+            error!(target = %target_addr, error = %e, "Failed to connect");
+            return Ok(error_response(StatusCode::BAD_GATEWAY, "Failed to connect to target"));
+        }
+    };
 
-        // Return appropriate status code based on error type
-        let error_code = match e.etype() {
-            ErrorType::ConnectTimedout => 504, // Gateway Timeout
-            ErrorType::ConnectRefused => 502,  // Bad Gateway
-            ErrorType::Custom(msg) if msg.contains("DNS") => 502,
-            _ => 502,
-        };
+    let io = TokioIo::new(stream);
 
-        FailToProxy {
-            error_code,
-            can_reuse_downstream: false,
+    // Create HTTP connection
+    let (mut sender, conn) = match hyper::client::conn::http1::handshake(io).await {
+        Ok(c) => c,
+        Err(e) => {
+            error!(target = %target_addr, error = %e, "HTTP handshake failed");
+            return Ok(error_response(StatusCode::BAD_GATEWAY, "HTTP handshake failed"));
+        }
+    };
+
+    // Spawn connection handler
+    tokio::spawn(async move {
+        if let Err(e) = conn.await {
+            debug!(error = %e, "Connection error");
+        }
+    });
+
+    // Build the request for the target
+    let (parts, body) = req.into_parts();
+    
+    // Create path with query
+    let path_and_query = parts.uri.path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or("/");
+    
+    let mut builder = Request::builder()
+        .method(parts.method)
+        .uri(path_and_query);
+    
+    // Copy headers
+    for (name, value) in parts.headers.iter() {
+        if name != "proxy-connection" {
+            builder = builder.header(name, value);
         }
     }
 
-    /// Logging after request completion.
-    async fn logging(
-        &self,
-        session: &mut Session,
-        _e: Option<&Error>,
-        ctx: &mut Self::CTX,
-    ) {
-        let status = session
-            .response_written()
-            .map(|r| r.status.as_u16())
-            .unwrap_or(0);
+    let req = builder.body(body).unwrap();
 
-        let method = if ctx.is_connect { "CONNECT" } else { "HTTP" };
-
-        debug!(
-            method = method,
-            host = %ctx.original_host,
-            port = ctx.target_port,
-            status = status,
-            "Request completed"
-        );
+    // Send request
+    match sender.send_request(req).await {
+        Ok(res) => {
+            let (parts, body) = res.into_parts();
+            let body = body.map_err(|e| e).boxed();
+            Ok(Response::from_parts(parts, body))
+        }
+        Err(e) => {
+            error!(error = %e, "Failed to send request");
+            Ok(error_response(StatusCode::BAD_GATEWAY, "Failed to send request"))
+        }
     }
+}
+
+/// Forward an HTTP request via upstream proxy.
+async fn forward_http_via_proxy(
+    req: Request<Incoming>,
+    proxy_url: String,
+) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
+    // Parse proxy URL
+    let proxy_uri: Uri = match proxy_url.parse() {
+        Ok(u) => u,
+        Err(_) => {
+            return Ok(error_response(StatusCode::BAD_GATEWAY, "Invalid proxy URL"));
+        }
+    };
+
+    let proxy_host = proxy_uri.host().unwrap_or("localhost");
+    let proxy_port = proxy_uri.port_u16().unwrap_or(3128);
+    let proxy_addr = format!("{}:{}", proxy_host, proxy_port);
+
+    // Connect to proxy
+    let stream = match TcpStream::connect(&proxy_addr).await {
+        Ok(s) => s,
+        Err(e) => {
+            error!(proxy = %proxy_addr, error = %e, "Failed to connect to proxy");
+            return Ok(error_response(StatusCode::BAD_GATEWAY, "Failed to connect to proxy"));
+        }
+    };
+
+    let io = TokioIo::new(stream);
+
+    let (mut sender, conn) = match hyper::client::conn::http1::handshake(io).await {
+        Ok(c) => c,
+        Err(e) => {
+            error!(error = %e, "Proxy handshake failed");
+            return Ok(error_response(StatusCode::BAD_GATEWAY, "Proxy handshake failed"));
+        }
+    };
+
+    tokio::spawn(async move {
+        if let Err(e) = conn.await {
+            debug!(error = %e, "Proxy connection error");
+        }
+    });
+
+    // For HTTP proxy, we send the full URL
+    let (parts, body) = req.into_parts();
+    
+    let mut builder = Request::builder()
+        .method(parts.method)
+        .uri(parts.uri.to_string());  // Full URL for proxy
+    
+    for (name, value) in parts.headers.iter() {
+        if name != "proxy-connection" {
+            builder = builder.header(name, value);
+        }
+    }
+
+    let req = builder.body(body).unwrap();
+
+    match sender.send_request(req).await {
+        Ok(res) => {
+            let (parts, body) = res.into_parts();
+            let body = body.map_err(|e| e).boxed();
+            Ok(Response::from_parts(parts, body))
+        }
+        Err(e) => {
+            error!(error = %e, "Failed to send request to proxy");
+            Ok(error_response(StatusCode::BAD_GATEWAY, "Proxy request failed"))
+        }
+    }
+}
+
+/// Bidirectional tunnel between two streams.
+async fn tunnel<A, B>(mut a: A, mut b: B) -> std::io::Result<()>
+where
+    A: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
+    let (bytes_a_to_b, bytes_b_to_a) = tokio::io::copy_bidirectional(&mut a, &mut b).await?;
+    debug!(
+        client_to_server = bytes_a_to_b,
+        server_to_client = bytes_b_to_a,
+        "Tunnel closed"
+    );
+    Ok(())
+}
+
+/// Parse CONNECT target (host:port).
+fn parse_connect_target(uri: &Uri) -> Option<(String, u16)> {
+    // CONNECT requests have authority in URI
+    if let Some(authority) = uri.authority() {
+        let host = authority.host().to_string();
+        let port = authority.port_u16().unwrap_or(443);
+        return Some((host, port));
+    }
+    
+    // Fallback: try parsing path as host:port
+    let path = uri.path();
+    if !path.is_empty() && path != "/" {
+        let parts: Vec<&str> = path.split(':').collect();
+        if parts.len() == 2 {
+            if let Ok(port) = parts[1].parse::<u16>() {
+                return Some((parts[0].to_string(), port));
+            }
+        }
+        // Default to port 443
+        return Some((path.to_string(), 443));
+    }
+    
+    None
+}
+
+/// Create an empty body.
+fn empty_body() -> BoxBody<Bytes, hyper::Error> {
+    Empty::<Bytes>::new()
+        .map_err(|never| match never {})
+        .boxed()
+}
+
+/// Create an error response.
+fn error_response(status: StatusCode, message: &str) -> Response<BoxBody<Bytes, hyper::Error>> {
+    Response::builder()
+        .status(status)
+        .header("Content-Type", "text/plain")
+        .header("Proxy-Agent", "host-proxy")
+        .body(Full::new(Bytes::from(message.to_string())).map_err(|never| match never {}).boxed())
+        .unwrap()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::HostMapping;
-
-    fn create_test_service() -> HostProxyService {
-        let config = AppConfig {
-            host_mappings: vec![HostMapping {
-                hostname: "test.example.com".to_string(),
-                ip: "192.168.1.100".to_string(),
-                port: Some(8080),
-            }],
-            ..Default::default()
-        };
-        HostProxyService::new(Arc::new(RwLock::new(config)))
-    }
 
     #[test]
     fn test_parse_connect_target() {
+        // CONNECT requests use the authority format (host:port)
+        // hyper parses "host:port" as authority
         let uri: Uri = "example.com:443".parse().unwrap();
-        let result = HostProxyService::parse_connect_target(&uri);
-        assert!(result.is_some());
-
-        let (host, port) = result.unwrap();
-        assert_eq!(host, "example.com");
-        assert_eq!(port, 443);
+        let result = parse_connect_target(&uri);
+        assert_eq!(result, Some(("example.com".to_string(), 443)));
     }
 
     #[test]
-    fn test_service_creation() {
-        let service = create_test_service();
-        // Just verify it creates without panicking
-        let ctx = service.new_ctx();
-        assert!(!ctx.is_connect);
-        assert!(ctx.resolve_result.is_none());
+    fn test_parse_connect_custom_port() {
+        let uri: Uri = "example.com:8443".parse().unwrap();
+        let result = parse_connect_target(&uri);
+        assert_eq!(result, Some(("example.com".to_string(), 8443)));
     }
 
     #[test]
-    fn test_ssl_config() {
-        let config = AppConfig {
-            ssl: crate::config::SslConfig {
-                accept_invalid_certs: true,
-                accept_invalid_hostnames: true,
-            },
-            ..Default::default()
-        };
-        let service = HostProxyService::new(Arc::new(RwLock::new(config)));
-
-        let (invalid_certs, invalid_hosts) = service.get_ssl_config();
-        assert!(invalid_certs);
-        assert!(invalid_hosts);
+    fn test_parse_connect_default_port() {
+        // When no port is provided, default to 443
+        let uri: Uri = "example.com".parse().unwrap();
+        let result = parse_connect_target(&uri);
+        assert_eq!(result, Some(("example.com".to_string(), 443)));
     }
 }
