@@ -1,0 +1,6 @@
+docker manifest create jeroenflvr/host-proxy:latest \
+  jeroenflvr/host-proxy:amd64 \
+  jeroenflvr/host-proxy:arm64
+
+
+docker manifest push jeroenflvr/host-proxy:latest
