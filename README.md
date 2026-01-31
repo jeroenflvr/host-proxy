@@ -1,6 +1,6 @@
 # Host Proxy
 
-A high-performance DNS bypass HTTP/HTTPS proxy server with configurable host-to-IP mappings, request blacklisting, and debug logging. Built with [hyper](https://hyper.rs/).
+A high-performance DNS bypass HTTP/HTTPS proxy server with configurable host-to-IP(:Port)mappings, request blacklisting, and debug logging. No admin privileges required. Built with [hyper](https://hyper.rs/).
 
 ## Features
 
