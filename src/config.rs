@@ -8,7 +8,6 @@ use crate::error::{ProxyError, Result};
 use notify::{Config as NotifyConfig, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::env;
 use std::fs;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -478,18 +477,6 @@ impl ConfigManager {
 
         Ok(rx)
     }
-}
-
-/// Gets the configuration file path from environment or default.
-pub fn get_config_path() -> PathBuf {
-    env::var("CONFIG_PATH")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("./config.yaml"))
-}
-
-/// Gets the log level override from environment.
-pub fn get_log_level_override() -> Option<String> {
-    env::var("LOG_LEVEL").ok()
 }
 
 #[cfg(test)]

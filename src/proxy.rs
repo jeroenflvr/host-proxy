@@ -103,12 +103,45 @@ async fn handle_request(
     let method = req.method().clone();
     let uri = req.uri().clone();
 
+    // Log basic request info
     debug!(
         client = %client_addr,
         method = %method,
         uri = %uri,
         "Request received"
     );
+
+    // Log query parameters in debug mode
+    if let Some(query) = uri.query() {
+        debug!(
+            client = %client_addr,
+            query = %query,
+            "Query parameters"
+        );
+    }
+
+    // Log request headers in debug mode
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        for (name, value) in req.headers() {
+            if let Ok(v) = value.to_str() {
+                // Skip sensitive headers
+                let display_value = if name.as_str().eq_ignore_ascii_case("authorization") 
+                    || name.as_str().eq_ignore_ascii_case("proxy-authorization")
+                    || name.as_str().eq_ignore_ascii_case("cookie") 
+                {
+                    "[REDACTED]"
+                } else {
+                    v
+                };
+                debug!(
+                    client = %client_addr,
+                    header_name = %name,
+                    header_value = %display_value,
+                    "Request header"
+                );
+            }
+        }
+    }
 
     if method == Method::CONNECT {
         // HTTPS CONNECT tunnel
@@ -421,6 +454,13 @@ async fn forward_http_request(
     // Build the request for the target
     let (parts, body) = req.into_parts();
     
+    // Log request body in debug mode (only for small bodies to avoid memory issues)
+    let body = if tracing::enabled!(tracing::Level::DEBUG) {
+        log_and_rebuild_body(body, &parts.method, &target_addr).await
+    } else {
+        body.boxed()
+    };
+    
     // Create path with query
     let path_and_query = parts.uri.path_and_query()
         .map(|pq| pq.as_str())
@@ -499,6 +539,13 @@ async fn forward_http_via_proxy(
     // For HTTP proxy, we send the full URL
     let (parts, body) = req.into_parts();
     
+    // Log request body in debug mode
+    let body = if tracing::enabled!(tracing::Level::DEBUG) {
+        log_and_rebuild_body(body, &parts.method, &proxy_addr).await
+    } else {
+        body.boxed()
+    };
+    
     let mut builder = Request::builder()
         .method(parts.method)
         .uri(parts.uri.to_string());  // Full URL for proxy
@@ -570,6 +617,74 @@ fn parse_connect_target(uri: &Uri) -> Option<(String, u16)> {
     }
     
     None
+}
+
+/// Log request body and rebuild it for forwarding (debug mode only).
+/// Only logs text-based bodies up to 64KB to avoid memory issues.
+async fn log_and_rebuild_body(
+    body: Incoming,
+    method: &Method,
+    target: &str,
+) -> BoxBody<Bytes, hyper::Error> {
+    use http_body_util::BodyExt;
+    
+    const MAX_BODY_LOG_SIZE: usize = 64 * 1024; // 64KB limit
+    
+    // Only log bodies for methods that typically have them
+    if method == Method::GET || method == Method::HEAD || method == Method::OPTIONS {
+        return body.boxed();
+    }
+    
+    // Collect the body
+    match body.collect().await {
+        Ok(collected) => {
+            let bytes = collected.to_bytes();
+            
+            if bytes.is_empty() {
+                debug!(target = %target, "Request body: <empty>");
+            } else if bytes.len() > MAX_BODY_LOG_SIZE {
+                debug!(
+                    target = %target,
+                    size = bytes.len(),
+                    "Request body: <{} bytes, too large to log>",
+                    bytes.len()
+                );
+            } else {
+                // Try to parse as UTF-8 text
+                match std::str::from_utf8(&bytes) {
+                    Ok(text) => {
+                        // Truncate for display if needed
+                        let body_text = if text.len() > 2048 {
+                            format!("{}... <truncated, {} bytes total>", &text[..2048], text.len())
+                        } else {
+                            text.to_string()
+                        };
+                        debug!(
+                            target = %target,
+                            body = %body_text,
+                            "Request body"
+                        );
+                    }
+                    Err(_) => {
+                        debug!(
+                            target = %target,
+                            size = bytes.len(),
+                            "Request body: <{} bytes, binary data>",
+                            bytes.len()
+                        );
+                    }
+                }
+            }
+            
+            // Rebuild the body
+            Full::new(bytes).map_err(|never| match never {}).boxed()
+        }
+        Err(e) => {
+            debug!(target = %target, error = %e, "Failed to read request body");
+            // Return empty body on error
+            Empty::<Bytes>::new().map_err(|never| match never {}).boxed()
+        }
+    }
 }
 
 /// Create an empty body.

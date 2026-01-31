@@ -24,18 +24,20 @@ use tracing_subscriber::{
 /// # Arguments
 ///
 /// * `config` - The logging configuration
-/// * `level_override` - Optional level override from environment
+/// * `level_override` - Optional level override from CLI/environment
+/// * `trace_deps` - If true, include verbose logging from dependencies
 ///
 /// # Example
 ///
 /// ```ignore
 /// let config = LoggingConfig::default();
-/// let _guard = init_logging(&config, None)?;
+/// let _guard = init_logging(&config, None, false)?;
 /// tracing::info!("Logging initialized");
 /// ```
 pub fn init_logging(
     config: &LoggingConfig,
     level_override: Option<String>,
+    trace_deps: bool,
 ) -> io::Result<Option<WorkerGuard>> {
     let level = level_override
         .as_ref()
@@ -54,11 +56,16 @@ pub fn init_logging(
             _ => "info",
         };
 
-        // Set default level and reduce noise from dependencies
-        EnvFilter::new(format!(
-            "{},hyper=warn,rustls=warn,h2=warn",
-            level_filter
-        ))
+        // If trace_deps is enabled, trace everything including dependencies
+        if trace_deps {
+            EnvFilter::new(level_filter)
+        } else {
+            // Set default level and reduce noise from dependencies
+            EnvFilter::new(format!(
+                "{},hyper=warn,rustls=warn,h2=warn",
+                level_filter
+            ))
+        }
     });
 
     // Create the writer and guard based on output destination

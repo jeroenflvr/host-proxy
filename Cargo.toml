@@ -1,6 +1,6 @@
 [package]
 name = "host-proxy"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "A DNS bypass HTTP/HTTPS proxy server with configurable host-to-IP mappings"
 authors = ["Jeroen"]
@@ -23,6 +23,9 @@ tokio = { version = "1", features = ["full", "sync"] }
 # Configuration
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
+
+# CLI argument parsing
+clap = { version = "4", features = ["derive", "env"] }
 
 # Logging
 tracing = "0.1"
