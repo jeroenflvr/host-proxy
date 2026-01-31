@@ -68,3 +68,28 @@ upstream_proxy:
     - "127.0.0.1"
     - "::1"
     - ".local"
+
+# Blacklist configuration
+# Block requests to specific hosts based on patterns and HTTP methods
+blacklist:
+  # Enable/disable the blacklist
+  enabled: false
+  
+  rules:
+    # Block all requests to ad domains
+    # - host: "ads.example.com"
+    #   reason: "Advertising blocked"
+    
+    # Block all subdomains of tracking.com (including tracking.com itself)
+    # - host: "*.tracking.com"
+    #   reason: "Tracking blocked"
+    
+    # Block only specific HTTP methods for a host
+    # - host: "api.example.com"
+    #   methods: ["DELETE", "PUT"]
+    #   reason: "Write operations blocked"
+    
+    # Block a method globally for all hosts
+    # - host: "*"
+    #   methods: ["TRACE"]
+    #   reason: "TRACE method disabled"

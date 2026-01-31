@@ -1,14 +1,16 @@
 # Host Proxy
 
-A high-performance DNS bypass HTTP/HTTPS proxy server with configurable host-to-IP (and port!) mappings, built with [hyper](https://hyper.rs/).
+A high-performance DNS bypass HTTP/HTTPS proxy server with configurable host-to-IP mappings, request blacklisting, and debug logging. Built with [hyper](https://hyper.rs/).
 
 ## Features
 
 - **DNS Bypass**: Route specific hostnames to configured IP addresses
 - **HTTPS Support**: Full CONNECT tunneling for secure connections
+- **Request Blacklist**: Block requests by host pattern, subdomain wildcards, and HTTP methods
 - **Upstream Proxy**: Forward to upstream HTTP/HTTPS proxies
 - **Hot Reload**: Configuration changes take effect without restart
-- **Flexible Logging**: Configurable levels, formats, and output destinations
+- **Debug Logging**: Log query parameters, headers, and request bodies
+- **CLI Options**: Override config via command line arguments
 - **High Performance**: Built on the hyper HTTP library
 
 ## Installation
@@ -34,7 +36,7 @@ docker build -t host-proxy .
 
 # Run with your config file mounted
 docker run -d \
-  --name jeroenflvr/host-proxy \
+  --name host-proxy \
   -p 1984:1984 \
   -v $(pwd)/config.yaml:/app/config.yaml:ro \
   host-proxy
@@ -55,36 +57,34 @@ docker compose down
 
 ## Quick Start
 
-1. **Create configuration file** (`config.yaml`):
+1. **Run without config** (uses defaults, listens on `:1984`):
+
+```bash
+./host-proxy -v
+```
+
+2. **Or create a configuration file** (`config.yaml`):
 
 ```yaml
 server:
   listen: "0.0.0.0:1984"
 
-ssl:
-  accept_invalid_certs: false
-
-logging:
-  level: "info"
-  output: "stdout"
-
 host_mappings:
   - hostname: "api.example.com"
     ip: "192.168.1.100"
     port: 8080
+
+blacklist:
+  enabled: true
+  rules:
+    - host: "*.ads.com"
+      reason: "Block ads"
 ```
 
-2. **Set up environment** (optional `.env` file):
-
-```env
-CONFIG_PATH=./config.yaml
-LOG_LEVEL=debug
-```
-
-3. **Run the proxy**:
+3. **Run with config**:
 
 ```bash
-./target/release/host-proxy
+./host-proxy -c config.yaml
 ```
 
 4. **Test it**:
@@ -95,6 +95,24 @@ curl -x http://localhost:1984 http://api.example.com/
 
 # HTTPS request through proxy
 curl -x http://localhost:1984 https://api.example.com/
+```
+
+## Command Line Options
+
+```
+Usage: host-proxy [OPTIONS]
+
+Options:
+  -c, --config <PATH>    Path to configuration file [env: CONFIG_PATH]
+  -l, --listen <ADDR>    Listen address (overrides config) [env: LISTEN_ADDR]
+  -v, --verbose...       Increase verbosity:
+                           -v    info level
+                           -vv   debug level (includes headers, query params)
+                           -vvv  trace level
+                           -vvvv trace level + dependency tracing
+  -q, --quiet            Quiet mode (errors only)
+  -h, --help             Print help
+  -V, --version          Print version
 ```
 
 ## Configuration
@@ -141,6 +159,35 @@ host_mappings:
     ip: "10.0.0.50"
 ```
 
+### Blacklist
+
+Block requests by host pattern and HTTP method:
+
+```yaml
+blacklist:
+  enabled: true
+  rules:
+    # Block all requests to a host
+    - host: "ads.example.com"
+      reason: "Advertising blocked"
+    
+    # Block all subdomains (*.tracking.com also matches tracking.com)
+    - host: "*.tracking.com"
+      reason: "Tracking blocked"
+    
+    # Block specific HTTP methods only
+    - host: "api.example.com"
+      methods: ["DELETE", "PUT"]
+      reason: "Write operations blocked"
+    
+    # Block a method globally
+    - host: "*"
+      methods: ["TRACE"]
+      reason: "TRACE disabled for security"
+```
+
+Blocked requests return `403 Forbidden` with an `X-Blocked-Reason` header.
+
 ### Upstream Proxy
 
 ```yaml
@@ -158,8 +205,7 @@ upstream_proxy:
 | Variable | Description | Example |
 |----------|-------------|---------|
 | `CONFIG_PATH` | Path to config file | `./config.yaml` |
-| `LOG_LEVEL` | Override log level | `debug` |
-| `RUST_LOG` | Fine-grained log control | `host_proxy=debug` |
+| `LISTEN_ADDR` | Override listen address | `0.0.0.0:8080` |
 
 > **Note**: Upstream proxy settings are configured **only** in `config.yaml`, not via
 > environment variables. This prevents infinite loops when host-proxy is set as your
@@ -255,11 +301,24 @@ ssl:
 cargo test
 ```
 
-### Running with Debug Logging
+### Debug Mode
+
+Use `-vv` to see query parameters, headers, and request bodies:
 
 ```bash
-LOG_LEVEL=debug cargo run
+./host-proxy -vv
 ```
+
+Example debug output:
+```
+DEBUG Request received client=127.0.0.1:54321 method=POST uri=http://api.example.com/users?page=1
+DEBUG Query parameters client=127.0.0.1:54321 query=page=1
+DEBUG Request header client=127.0.0.1:54321 header_name=content-type header_value=application/json
+DEBUG Request header client=127.0.0.1:54321 header_name=authorization header_value=[REDACTED]
+DEBUG Request body target=192.168.1.100:8080 body={"name":"test"}
+```
+
+Sensitive headers (`Authorization`, `Cookie`, `Proxy-Authorization`) are automatically redacted.
 
 ### Building Release
 

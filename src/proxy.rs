@@ -111,6 +111,24 @@ async fn handle_request(
         "Request received"
     );
 
+    // Extract host for blacklist check
+    let host = extract_host(&uri, req.headers());
+    
+    // Check blacklist before processing
+    {
+        let cfg = config.read().expect("config lock poisoned");
+        if let Some(reason) = cfg.blacklist.should_block(&host, method.as_str()) {
+            warn!(
+                client = %client_addr,
+                host = %host,
+                method = %method,
+                reason = %reason,
+                "Request blocked by blacklist"
+            );
+            return Ok(blocked_response(&reason));
+        }
+    }
+
     // Log query parameters in debug mode
     if let Some(query) = uri.query() {
         debug!(
@@ -150,6 +168,36 @@ async fn handle_request(
         // Regular HTTP proxy
         handle_http(req, client_addr, config, resolver).await
     }
+}
+
+/// Extract host from URI or headers.
+fn extract_host(uri: &Uri, headers: &http::HeaderMap) -> String {
+    // For CONNECT requests, host is in the authority
+    if let Some(authority) = uri.authority() {
+        return authority.host().to_string();
+    }
+    
+    // For regular HTTP, try URI host first
+    if let Some(host) = uri.host() {
+        return host.to_string();
+    }
+    
+    // Fall back to Host header
+    headers.get("host")
+        .and_then(|h| h.to_str().ok())
+        .map(|h| h.split(':').next().unwrap_or(h).to_string())
+        .unwrap_or_default()
+}
+
+/// Create a blocked response (403 Forbidden).
+fn blocked_response(reason: &str) -> Response<BoxBody<Bytes, hyper::Error>> {
+    Response::builder()
+        .status(StatusCode::FORBIDDEN)
+        .header("Content-Type", "text/plain")
+        .header("Proxy-Agent", "host-proxy")
+        .header("X-Blocked-Reason", reason)
+        .body(Full::new(Bytes::from(format!("Blocked: {}", reason))).map_err(|never| match never {}).boxed())
+        .unwrap()
 }
 
 /// Handle CONNECT requests (HTTPS tunneling).

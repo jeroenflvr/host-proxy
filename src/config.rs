@@ -288,6 +288,104 @@ impl UpstreamProxyConfig {
     }
 }
 
+/// A single blacklist rule for blocking requests.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BlacklistRule {
+    /// Host pattern to match. Supports:
+    /// - Exact match: "example.com"
+    /// - Wildcard: "*.example.com" (matches subdomains)
+    /// - Full wildcard: "*" (matches all hosts)
+    pub host: String,
+
+    /// HTTP methods to block. If empty, blocks all methods.
+    /// Examples: ["GET", "POST"], ["*"] for all
+    #[serde(default)]
+    pub methods: Vec<String>,
+
+    /// Optional reason for blocking (logged when request is blocked).
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+impl BlacklistRule {
+    /// Checks if this rule matches the given host and method.
+    pub fn matches(&self, host: &str, method: &str) -> bool {
+        // Check method first (faster to short-circuit)
+        if !self.matches_method(method) {
+            return false;
+        }
+        
+        self.matches_host(host)
+    }
+    
+    /// Checks if the method matches this rule.
+    fn matches_method(&self, method: &str) -> bool {
+        // Empty methods list means match all
+        if self.methods.is_empty() {
+            return true;
+        }
+        
+        let method_upper = method.to_uppercase();
+        self.methods.iter().any(|m| {
+            let m_upper = m.to_uppercase();
+            m_upper == "*" || m_upper == method_upper
+        })
+    }
+    
+    /// Checks if the host matches this rule's pattern.
+    fn matches_host(&self, host: &str) -> bool {
+        let pattern = self.host.to_lowercase();
+        let host_lower = host.to_lowercase();
+        
+        // Full wildcard
+        if pattern == "*" {
+            return true;
+        }
+        
+        // Wildcard subdomain match: *.example.com
+        if pattern.starts_with("*.") {
+            let suffix = &pattern[1..]; // ".example.com"
+            // Match the suffix OR exact domain match (*.example.com matches example.com)
+            let base_domain = &pattern[2..]; // "example.com"
+            return host_lower.ends_with(suffix) || host_lower == base_domain;
+        }
+        
+        // Exact match
+        pattern == host_lower
+    }
+}
+
+/// Blacklist configuration section.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct BlacklistConfig {
+    /// Whether the blacklist is enabled.
+    pub enabled: bool,
+
+    /// List of blacklist rules.
+    pub rules: Vec<BlacklistRule>,
+}
+
+impl BlacklistConfig {
+    /// Checks if a request should be blocked.
+    /// Returns Some(reason) if blocked, None if allowed.
+    pub fn should_block(&self, host: &str, method: &str) -> Option<String> {
+        if !self.enabled {
+            return None;
+        }
+        
+        for rule in &self.rules {
+            if rule.matches(host, method) {
+                return Some(rule.reason.clone().unwrap_or_else(|| {
+                    format!("Blocked by rule: {}", rule.host)
+                }));
+            }
+        }
+        
+        None
+    }
+}
+
 /// Root configuration structure.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(default)]
@@ -306,6 +404,9 @@ pub struct AppConfig {
 
     /// Upstream proxy configuration.
     pub upstream_proxy: UpstreamProxyConfig,
+
+    /// Blacklist configuration.
+    pub blacklist: BlacklistConfig,
 }
 
 impl AppConfig {
@@ -663,5 +764,153 @@ logging:
         // No proxy configured should return None
         let empty_config = UpstreamProxyConfig::default();
         assert!(empty_config.effective_http_proxy(Some("0.0.0.0:1984")).is_none());
+    }
+
+    #[test]
+    fn test_blacklist_exact_host() {
+        let config = BlacklistConfig {
+            enabled: true,
+            rules: vec![
+                BlacklistRule {
+                    host: "blocked.com".to_string(),
+                    methods: vec![],
+                    reason: Some("Test block".to_string()),
+                },
+            ],
+        };
+
+        // Should block
+        assert!(config.should_block("blocked.com", "GET").is_some());
+        assert!(config.should_block("blocked.com", "POST").is_some());
+        
+        // Should not block
+        assert!(config.should_block("allowed.com", "GET").is_none());
+        assert!(config.should_block("sub.blocked.com", "GET").is_none());
+    }
+
+    #[test]
+    fn test_blacklist_wildcard_subdomain() {
+        let config = BlacklistConfig {
+            enabled: true,
+            rules: vec![
+                BlacklistRule {
+                    host: "*.blocked.com".to_string(),
+                    methods: vec![],
+                    reason: None,
+                },
+            ],
+        };
+
+        // Should block subdomains
+        assert!(config.should_block("sub.blocked.com", "GET").is_some());
+        assert!(config.should_block("deep.sub.blocked.com", "GET").is_some());
+        
+        // Should also block the base domain itself
+        assert!(config.should_block("blocked.com", "GET").is_some());
+        
+        // Should not block other domains
+        assert!(config.should_block("blocked.com.evil.com", "GET").is_none());
+        assert!(config.should_block("notblocked.com", "GET").is_none());
+    }
+
+    #[test]
+    fn test_blacklist_full_wildcard() {
+        let config = BlacklistConfig {
+            enabled: true,
+            rules: vec![
+                BlacklistRule {
+                    host: "*".to_string(),
+                    methods: vec!["DELETE".to_string()],
+                    reason: Some("No DELETE allowed".to_string()),
+                },
+            ],
+        };
+
+        // Should block DELETE for any host
+        assert!(config.should_block("any.com", "DELETE").is_some());
+        assert!(config.should_block("other.org", "delete").is_some()); // case insensitive
+        
+        // Should not block other methods
+        assert!(config.should_block("any.com", "GET").is_none());
+        assert!(config.should_block("any.com", "POST").is_none());
+    }
+
+    #[test]
+    fn test_blacklist_method_filter() {
+        let config = BlacklistConfig {
+            enabled: true,
+            rules: vec![
+                BlacklistRule {
+                    host: "api.example.com".to_string(),
+                    methods: vec!["POST".to_string(), "PUT".to_string()],
+                    reason: None,
+                },
+            ],
+        };
+
+        // Should block specified methods
+        assert!(config.should_block("api.example.com", "POST").is_some());
+        assert!(config.should_block("api.example.com", "PUT").is_some());
+        assert!(config.should_block("api.example.com", "post").is_some()); // case insensitive
+        
+        // Should not block other methods
+        assert!(config.should_block("api.example.com", "GET").is_none());
+        assert!(config.should_block("api.example.com", "DELETE").is_none());
+    }
+
+    #[test]
+    fn test_blacklist_disabled() {
+        let config = BlacklistConfig {
+            enabled: false,
+            rules: vec![
+                BlacklistRule {
+                    host: "blocked.com".to_string(),
+                    methods: vec![],
+                    reason: None,
+                },
+            ],
+        };
+
+        // Should not block when disabled
+        assert!(config.should_block("blocked.com", "GET").is_none());
+    }
+
+    #[test]
+    fn test_blacklist_multiple_rules() {
+        let config = BlacklistConfig {
+            enabled: true,
+            rules: vec![
+                BlacklistRule {
+                    host: "ads.example.com".to_string(),
+                    methods: vec![],
+                    reason: Some("No ads".to_string()),
+                },
+                BlacklistRule {
+                    host: "*.tracking.com".to_string(),
+                    methods: vec![],
+                    reason: Some("No tracking".to_string()),
+                },
+                BlacklistRule {
+                    host: "*".to_string(),
+                    methods: vec!["TRACE".to_string()],
+                    reason: Some("TRACE disabled".to_string()),
+                },
+            ],
+        };
+
+        // First rule
+        let result = config.should_block("ads.example.com", "GET");
+        assert_eq!(result, Some("No ads".to_string()));
+        
+        // Second rule
+        let result = config.should_block("sub.tracking.com", "POST");
+        assert_eq!(result, Some("No tracking".to_string()));
+        
+        // Third rule
+        let result = config.should_block("any.com", "TRACE");
+        assert_eq!(result, Some("TRACE disabled".to_string()));
+        
+        // Allowed
+        assert!(config.should_block("allowed.com", "GET").is_none());
     }
 }
